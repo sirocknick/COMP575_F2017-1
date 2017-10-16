@@ -24,6 +24,7 @@
 // To handle shutdown signals so the node quits properly in response to "rosnode kill"
 
 #include <signal.h>
+#include <string>
 #include <math.h>
 
 using namespace std;
@@ -44,7 +45,7 @@ float status_publish_interval = 5;
 float kill_switch_timeout = 10;
 
 pose current_location;
-
+pose rover_locations[3];
 int transitions_to_auto = 0;
 double time_stamp_transition_to_auto = 0.0;
 
@@ -60,6 +61,9 @@ ros::Publisher target_collected_publisher;
 ros::Publisher angular_publisher;
 ros::Publisher messagePublish;
 ros::Publisher debug_publisher;
+ros::Publisher pose_publisher;
+ros::Publisher global_average_heading_publisher;
+ros::Publisher local_average_heading_publisher;
 
 //Subscribers
 ros::Subscriber joySubscriber;
@@ -67,7 +71,7 @@ ros::Subscriber modeSubscriber;
 ros::Subscriber targetSubscriber;
 ros::Subscriber obstacleSubscriber;
 ros::Subscriber odometrySubscriber;
-
+ros::Subscriber pose_subscriber;
 ros::Subscriber messageSubscriber;
 
 //Timers
@@ -91,6 +95,8 @@ void mobilityStateMachine(const ros::TimerEvent &);
 void publishStatusTimerEventHandler(const ros::TimerEvent &event);
 void killSwitchTimerEventHandler(const ros::TimerEvent &event);
 void messageHandler(const std_msgs::String::ConstPtr &message);
+void poseHandler(const std_msgs::String::ConstPtr &message);
+
 
 int main(int argc, char **argv)
 {
@@ -120,6 +126,7 @@ int main(int argc, char **argv)
     obstacleSubscriber = mNH.subscribe((rover_name + "/obstacle"), 10, obstacleHandler);
     odometrySubscriber = mNH.subscribe((rover_name + "/odom/ekf"), 10, odometryHandler);
     messageSubscriber = mNH.subscribe(("messages"), 10, messageHandler);
+    pose_subscriber = mNH.subscribe("pose",10,poseHandler);
 
     status_publisher = mNH.advertise<std_msgs::String>((rover_name + "/status"), 1, true);
     velocityPublish = mNH.advertise<geometry_msgs::Twist>((rover_name + "/velocity"), 10);
@@ -132,6 +139,9 @@ int main(int argc, char **argv)
     stateMachineTimer = mNH.createTimer(ros::Duration(mobility_loop_time_step), mobilityStateMachine);
     debug_publisher = mNH.advertise<std_msgs::String>("/debug", 1, true);
     messagePublish = mNH.advertise<std_msgs::String>(("messages"), 10 , true);
+    pose_publisher = mNH.advertise<std_msgs::String>("pose",10, true);
+    global_average_heading_publisher = mNH.advertise<std_msgs::String>("gah",10,true);
+    local_average_heading_publisher =  mNH.advertise<std_msgs::String>("lah",10,true);
     
     ros::spin();
     return EXIT_SUCCESS;
@@ -140,7 +150,11 @@ int main(int argc, char **argv)
 void mobilityStateMachine(const ros::TimerEvent &)
 {
     std_msgs::String state_machine_msg;
-
+    std_msgs::String pose_msg;
+    std::stringstream pose_converter;
+    pose_converter << rover_name << " " << current_location.x << " " << current_location.y << " " << current_location.theta;
+    pose_msg.data = pose_converter.str();
+    pose_publisher.publish(pose_msg);
     if ((simulation_mode == 2 || simulation_mode == 3)) // Robot is in automode
     {
         if (transitions_to_auto == 0)
@@ -279,4 +293,95 @@ void sigintEventHandler(int sig)
 
 void messageHandler(const std_msgs::String::ConstPtr& message)
 {
+}
+
+int get_rover_name_index(string name) {
+    string names[] = { "achilles", "ajax", "aeneas"};
+    for (int name_index = 0; name_index < 3; name_index++) {
+        if (name == names[name_index]) {
+            return name_index;
+        }
+    }
+    return 0;
+}
+
+double parseDouble(string double_string) {
+    stringstream stream;
+    stream << double_string;
+    double double_value;
+    stream >> double_value;
+    return double_value;
+}
+
+void parsePoseMessage(string msg_string){
+    int name_position = msg_string.find_first_of(" ");
+    string message_rover_name = msg_string.substr(0,name_position);
+    int name_index = get_rover_name_index(message_rover_name);
+    msg_string = msg_string.substr(name_position+1);
+    int x_position = msg_string.find_first_of(" ");
+    string x_message = msg_string.substr(0,x_position);
+    double x = parseDouble(x_message);
+    msg_string = msg_string.substr(x_position+1);
+    int y_position = msg_string.find_first_of(" ");
+    string y_message = msg_string.substr(0,y_position);
+    double y = parseDouble(y_message);
+    msg_string = msg_string.substr(y_position+1);
+    double theta = parseDouble(msg_string);
+
+    rover_locations[name_index].x = x;
+    rover_locations[name_index].y = y;
+    rover_locations[name_index].theta = theta;
+}
+
+void computeAndPublishGlobalAverageHeading() {
+    double average_cosine = 0;
+    double average_sine = 0;
+    for (int heading = 0; heading < 3; heading++) {
+        average_cosine += cos(rover_locations[heading].theta);
+        average_sine += sin(rover_locations[heading].theta);
+    }
+    double global_average_heading = atan2(average_sine,average_cosine);
+    std_msgs::String global_average_heading_msg;
+    std::stringstream global_average_heading_converter;
+    global_average_heading_converter << global_average_heading;
+    global_average_heading_msg.data = global_average_heading_converter.str();
+    global_average_heading_publisher.publish(global_average_heading_msg);
+}
+void computeAndPublishLocalAverageHeading() {
+    double average_cosine = 0;
+    double average_sine = 0;
+    int neighbor_count = 0;
+    int my_index = get_rover_name_index(rover_name);
+    for (int rover = 0; rover < 3; rover++)
+    {
+        if (rover != my_index) {
+            double delta_x = current_location.x - rover_locations[rover].x;
+            double delta_y = current_location.y - rover_locations[rover].y;
+            double distance = hypot(delta_x,delta_y);
+            if (distance <= 2.0) {
+                average_cosine += cos(rover_locations[rover].theta);
+                average_sine += sin(rover_locations[rover].theta);
+                neighbor_count += 1;
+            }
+        }
+    }
+    double local_average_heading;
+    if (neighbor_count > 0) {
+        local_average_heading = atan2(average_sine,average_cosine);
+    }
+    else {
+        local_average_heading = current_location.theta;
+    }
+    stringstream local_average_heading_converter;
+    local_average_heading_converter << local_average_heading;
+    std_msgs::String local_average_heading_msg;
+    local_average_heading_msg.data = local_average_heading_converter.str();
+    local_average_heading_publisher.publish(local_average_heading_msg);
+}
+
+void poseHandler(const std_msgs::String::ConstPtr &message)
+{
+    parsePoseMessage(message->data);
+    computeAndPublishGlobalAverageHeading();
+    computeAndPublishLocalAverageHeading();
 }
