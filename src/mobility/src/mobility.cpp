@@ -1,5 +1,5 @@
 #include <ros/ros.h>
-
+//
 // ROS libraries
 #include <angles/angles.h>
 #include <random_numbers/random_numbers.h>
@@ -7,6 +7,7 @@
 
 // ROS messages
 #include <std_msgs/Int16.h>
+#include <std_msgs/Float32.h>
 #include <std_msgs/UInt8.h>
 #include <std_msgs/String.h>
 #include <sensor_msgs/Joy.h>
@@ -15,66 +16,98 @@
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Odometry.h>
 
+#include "RotationalController.h"
+#include "TranslationalController.h"
+#include "SearchController.h"
 #include "Pose.h"
 #include "TargetState.h"
-#include "RotationalController.h"
+
 // Custom messages
 #include <shared_messages/TagsImage.h>
 
 // To handle shutdown signals so the node quits properly in response to "rosnode kill"
 
 #include <signal.h>
-#include <string>
 #include <math.h>
 
 using namespace std;
 
 // Random number generator
 random_numbers::RandomNumberGenerator *rng;
+
+TranslationalController translational_controller;
+RotationalController rotational_controller;
+RotationalController rotational_translational_controller;
+SearchController search_controller;
+
 string rover_name;
-map<string,pose> rover_locations;
-set<string> rover_names;
 char host[128];
 bool is_published_name = false;
+
 int simulation_mode = 0;
 float mobility_loop_time_step = 0.1;
 float status_publish_interval = 5;
 float kill_switch_timeout = 10;
 
 pose current_location;
-pose goal_location;
+pose goal;
+pose alternative_location;
+pose saved_location;
 
-RotationalController rotational_controller;
+int claimed_target_id;
+const int HOME_APRIL_TAG_ID = 256;
+const int TOTAL_NUMBER_RESOURCES = 256;
+vector<TargetState> targets;
+
 int transitions_to_auto = 0;
 double time_stamp_transition_to_auto = 0.0;
-
+double current_time_for_paper = 0.0;
+int targets_home_size = 0;
+float my_distance = 0.0;
+vector <float> distances;
+// Set true when we are inside the center circle and we need to drop the block,
+// back out, and reset the boolean cascade.
+// New variables for improved obstacle avoidance and pickup of targets while keeping with waypoint based search
+bool obstacle_encountered = false;
+bool is_resource_picked_up = false;
+// central collection point has been seen (aka the nest)
+bool is_home_seen = false;
+std_msgs::Int16 targetDetected; // ID of detected target
+bool targetsCollected[256] = {0}; // array of booleans indicating whether each target ID has been found.
 // state machine states
-#define STATE_MACHINE_TRANSLATE 0
-#define COUNT_STATE 1
-int state_machine_state = COUNT_STATE;
-int count_same = 0;
+#define SEARCH_STATE 0
+#define DROPOFF_STATE 1
+#define RESUME_SEARCH_STATE 2
+#define OBSTACLE_STATE 3
+
+int current_state = SEARCH_STATE;
+int previous_state = SEARCH_STATE;
+
 //Publishers
 ros::Publisher velocityPublish;
 ros::Publisher stateMachinePublish;
 ros::Publisher status_publisher;
 ros::Publisher target_collected_publisher;
+ros::Publisher targetPickUpPublish;
+ros::Publisher targetDropOffPublish;
 ros::Publisher angular_publisher;
 ros::Publisher messagePublish;
 ros::Publisher debug_publisher;
-ros::Publisher pose_publisher;
-ros::Publisher name_publisher;
-ros::Publisher global_average_heading_publisher;
-ros::Publisher local_average_heading_publisher;
-
+ros::Publisher pickup_publisher;
+ros::Publisher info_for_paper_publisher;
+ros::Publisher project_pickup_publisher;
+ros::Publisher project_arrival_publisher;
 //Subscribers
 ros::Subscriber joySubscriber;
 ros::Subscriber modeSubscriber;
 ros::Subscriber targetSubscriber;
 ros::Subscriber obstacleSubscriber;
 ros::Subscriber odometrySubscriber;
-ros::Subscriber pose_subscriber;
-ros::Subscriber name_subscriber;
+ros::Subscriber targetsCollectedSubscriber;
 ros::Subscriber messageSubscriber;
+ros::Subscriber pickup_subscriber;
+ros::Subscriber project_pickup_subscriber;
+ros::Subscriber project_arrival_subscriber;
 
 //Timers
 ros::Timer stateMachineTimer;
@@ -96,20 +129,45 @@ void odometryHandler(const nav_msgs::Odometry::ConstPtr &message);
 void mobilityStateMachine(const ros::TimerEvent &);
 void publishStatusTimerEventHandler(const ros::TimerEvent &event);
 void killSwitchTimerEventHandler(const ros::TimerEvent &event);
-void messageHandler(const std_msgs::String::ConstPtr &message);
-void poseHandler(const std_msgs::String::ConstPtr &message);
-void nameHandler(const std_msgs::String::ConstPtr &message);
-double computeAndPublishLocalAverageHeading();
-double computeAndPublishGlobalAverageHeading();
+void pickupHandler(const std_msgs::Int16::ConstPtr &message);
+void projectArrivalHandler(const std_msgs::Float32::ConstPtr &message);
+void projectPickupHandler(const std_msgs::Float32::ConstPtr &message);
+
+//Utility functions
+float distanceToHome();
+void deleteFromDistanceVector(float distance);
+void insertIntoDistanceVector(float distance);
+double computeGoalTheta();
+double computeDistanceBetweenWaypoints(pose final_location, pose start_location);
+void debugWaypoints();
+void debugRotate();
+void debugTranslate(double distance_);
+void debugRandom();
+void visitRandomLocation();
+bool isGoalReachedR();
+bool isGoalReached();
+void reportDetected(int tag_id);
+void process_resources(const shared_messages::TagsImage::ConstPtr &message);
+void process_home_tags(const shared_messages::TagsImage::ConstPtr &message);
+pose getAlternativeLocation();
+pose getCurrentLocation();
+pose getHomeLocation();
+pose getSavedLocation();
+pose getNextSearchLocation();
+pose getCurrentSearchLocation();
+bool isGoalReached();
+void automodeStateMachine();
+void driveTowardsGoal();
 
 int main(int argc, char **argv)
 {
     gethostname(host, sizeof(host));
     string hostName(host);
 
-    rotational_controller = RotationalController();
     rng = new random_numbers::RandomNumberGenerator(); // instantiate random number generator
 
+    claimed_target_id = -1; // initialize target claimed
+    targetDetected.data = -1;
     if (argc >= 2)
     {
         rover_name = argv[1];
@@ -119,7 +177,7 @@ int main(int argc, char **argv)
         rover_name = hostName;
         cout << "No Name Selected. Default is: " << rover_name << endl;
     }
-    rover_names.insert(rover_name);
+    search_controller = SearchController(rover_name);
     // NoSignalHandler so we can catch SIGINT ourselves and shutdown the node
     ros::init(argc, argv, (rover_name + "_MOBILITY"), ros::init_options::NoSigintHandler);
     ros::NodeHandle mNH;
@@ -131,43 +189,134 @@ int main(int argc, char **argv)
     targetSubscriber = mNH.subscribe((rover_name + "/targets"), 10, targetHandler);
     obstacleSubscriber = mNH.subscribe((rover_name + "/obstacle"), 10, obstacleHandler);
     odometrySubscriber = mNH.subscribe((rover_name + "/odom/ekf"), 10, odometryHandler);
-    messageSubscriber = mNH.subscribe(("messages"), 10, messageHandler);
-    pose_subscriber = mNH.subscribe("pose",10,poseHandler);
-    name_subscriber = mNH.subscribe("name",10,nameHandler);
-
+    project_pickup_subscriber = mNH.subscribe("project_pickup",10, projectPickupHandler);
+    project_arrival_subscriber = mNH.subscribe("project_arrival",10, projectArrivalHandler);
+    pickup_subscriber = mNH.subscribe("pickup", 10, pickupHandler );
     status_publisher = mNH.advertise<std_msgs::String>((rover_name + "/status"), 1, true);
     velocityPublish = mNH.advertise<geometry_msgs::Twist>((rover_name + "/velocity"), 10);
     stateMachinePublish = mNH.advertise<std_msgs::String>((rover_name + "/state_machine"), 1, true);
     messagePublish = mNH.advertise<std_msgs::String>(("messages"), 10, true);
     target_collected_publisher = mNH.advertise<std_msgs::Int16>(("targetsCollected"), 1, true);
+    targetPickUpPublish = mNH.advertise<sensor_msgs::Image>((rover_name + "/targetPickUpImage"), 1, true);
+    targetDropOffPublish = mNH.advertise<sensor_msgs::Image>((rover_name + "/targetDropOffImage"), 1, true);
     angular_publisher = mNH.advertise<std_msgs::String>((rover_name + "/angular"),1,true);
     publish_status_timer = mNH.createTimer(ros::Duration(status_publish_interval), publishStatusTimerEventHandler);
     killSwitchTimer = mNH.createTimer(ros::Duration(kill_switch_timeout), killSwitchTimerEventHandler);
     stateMachineTimer = mNH.createTimer(ros::Duration(mobility_loop_time_step), mobilityStateMachine);
     debug_publisher = mNH.advertise<std_msgs::String>("/debug", 1, true);
-    messagePublish = mNH.advertise<std_msgs::String>(("messages"), 10 , true);
-    pose_publisher = mNH.advertise<std_msgs::String>("pose",10, true);
-    name_publisher = mNH.advertise<std_msgs::String>("name",10, true);
-    global_average_heading_publisher = mNH.advertise<std_msgs::String>("gah",10,true);
-    local_average_heading_publisher =  mNH.advertise<std_msgs::String>("lah",10,true);
-    
+    pickup_publisher = mNH.advertise<std_msgs::Int16>(("pickup"), 1, true);
+    project_pickup_publisher = mNH.advertise<std_msgs::Float32>(("project_pickup"),6,true);
+    project_arrival_publisher = mNH.advertise<std_msgs::Float32>(("project_arrival"),6,true);
+    info_for_paper_publisher = mNH.advertise<std_msgs::String>("info_for_paper", 10, true);
+
     ros::spin();
     return EXIT_SUCCESS;
+}
+
+pose getAlternativeLocation() {
+    return alternative_location;
+}
+pose getNextSearchLocation() {
+    return search_controller.getNextWaypoint(current_location);
+}
+pose getCurrentSearchLocation() {
+    return search_controller.getCurrentWaypoint(current_location);
+}
+pose getHomeLocation() {
+    pose home_location;
+    home_location.x = 0;
+    home_location.y = 0;
+    home_location.theta = 0;
+    return home_location;
+}
+pose getCurrentLocation() {
+    return current_location;
+}
+pose getSavedLocation() {
+    return saved_location;
+}
+
+void driveTowardsGoal() {
+    double angular_velocity = rotational_translational_controller.calculateVelocity(current_location, goal);
+    double linear_velocity = 0.00;
+    if (!isGoalReachedR() && !obstacle_encountered && (current_state == SEARCH_STATE || current_state == RESUME_SEARCH_STATE)) {
+        linear_velocity = 0.05;
+    }
+    else if (!isGoalReached()) {
+        linear_velocity = translational_controller.calculateVelocity(current_location, goal);
+    }
+    setVelocity(linear_velocity, angular_velocity);
+}
+
+void automodeStateMachine() {
+    std_msgs::String state_machine_msg;
+    if (obstacle_encountered) {
+        obstacle_encountered = false;
+        goal = getAlternativeLocation();
+    }
+    else {
+    switch(current_state) {
+        case SEARCH_STATE:
+            state_machine_msg.data = "SEARCH";
+            goal = getCurrentSearchLocation();
+            if (is_resource_picked_up) {
+                saved_location = current_location;
+                saved_location.x += 0.75*cos(current_location.theta);
+                saved_location.y += 0.75*sin(current_location.theta);
+                goal = getHomeLocation();
+                my_distance = distanceToHome();
+                std_msgs::Float32 msg;
+                msg.data = my_distance;
+                project_pickup_publisher.publish(msg);
+                current_state = DROPOFF_STATE;
+            } else if (isGoalReached()) {
+                goal = getNextSearchLocation();
+            }
+            break;
+        case DROPOFF_STATE:
+            state_machine_msg.data = "DROPOFF";
+            if (find(distances.begin(), distances.end(), my_distance) == distances.begin()) {
+                   goal = getHomeLocation();
+            } else {
+                goal = current_location;
+            }
+
+            if (is_home_seen) {
+                goal = getSavedLocation();
+                is_resource_picked_up = false;
+                is_home_seen = false;
+                std_msgs::Float32 msg;
+                msg.data = my_distance;
+                project_arrival_publisher.publish(msg);
+                current_state = RESUME_SEARCH_STATE;
+            }
+            break;
+        case RESUME_SEARCH_STATE:
+            state_machine_msg.data = "RESUME";
+            goal = getSavedLocation();
+            if (is_resource_picked_up) {
+                goal = getHomeLocation();
+                my_distance = distanceToHome();
+                std_msgs::Float32 msg;
+                msg.data = my_distance;
+                project_pickup_publisher.publish(msg);
+                current_state = DROPOFF_STATE;
+            } else if (isGoalReached()) {
+                goal = getCurrentSearchLocation();
+                current_state = SEARCH_STATE;
+            }
+            break;
+    }
+    }
+    driveTowardsGoal();
+    stateMachinePublish.publish(state_machine_msg);
 }
 
 void mobilityStateMachine(const ros::TimerEvent &)
 {
     std_msgs::String state_machine_msg;
-    std_msgs::String pose_msg;
-    std::stringstream pose_converter;
-    pose_converter << rover_name << " " << current_location.x << " " << current_location.y << " " << current_location.theta;
-    pose_msg.data = pose_converter.str();
-    pose_publisher.publish(pose_msg);
-    std_msgs::String name_msg;
-    stringstream name_converter;
-    name_converter << rover_name << " " << rover_names.size();
-    name_msg.data = name_converter.str();
-    name_publisher.publish(name_msg);
+    std_msgs::String info_for_paper;
+
     if ((simulation_mode == 2 || simulation_mode == 3)) // Robot is in automode
     {
         if (transitions_to_auto == 0)
@@ -176,40 +325,7 @@ void mobilityStateMachine(const ros::TimerEvent &)
             transitions_to_auto++;
             time_stamp_transition_to_auto = ros::Time::now().toSec();
         }
-        switch (state_machine_state)
-        {
-        case COUNT_STATE:
-        {
-            if (count_same >= 100) {
-                state_machine_state = STATE_MACHINE_TRANSLATE;
-            }
-            else {
-
-            }
-            break;
-        }
-        case STATE_MACHINE_TRANSLATE:
-        {
-            state_machine_msg.data = "TRANSLATING";//, " + converter.str();
-            //float angular_velocity = 0.2;
-            //float linear_velocity = 0.1;
-            goal_location = current_location;
-            goal_location.theta = computeAndPublishGlobalAverageHeading();
-            if (rover_name != "achilles") {
-            setVelocity(0.1, rotational_controller.calculateVelocity(current_location,goal_location));
-            }
-            else {
-                setVelocity(0.1, 0.2);
-            }
-            break;
-        }
-        default:
-        {
-            state_machine_msg.data = "DEFAULT CASE: SOMETHING WRONG!!!!";
-            break;
-        }
-        }
-
+        automodeStateMachine();
     }
     else
     { // mode is NOT auto
@@ -220,7 +336,12 @@ void mobilityStateMachine(const ros::TimerEvent &)
 
         state_machine_msg.data = "WAITING, " + converter.str();
     }
-    stateMachinePublish.publish(state_machine_msg);
+   // stateMachinePublish.publish(state_machine_msg);
+    current_time_for_paper = ros::Time::now().toSec();
+    std::stringstream ss_converter;
+    ss_converter << rover_name << ", " << current_time_for_paper-time_stamp_transition_to_auto << ", " << targets_home_size << ", " << current_location.x << ", " << current_location.y << ", " << current_location.theta;
+    info_for_paper.data = ss_converter.str();
+    //info_for_paper_publisher.publish(info_for_paper);
 }
 
 void setVelocity(double linearVel, double angularVel)
@@ -241,7 +362,82 @@ void setVelocity(double linearVel, double angularVel)
  * ROS CALLBACK HANDLERS
  ************************/
 void targetHandler(const shared_messages::TagsImage::ConstPtr &message) {
-    // Only used if we want to take action after seeing an April Tag.
+    // If in manual mode do not try to automatically pick up the target
+    if (simulation_mode == 1 || simulation_mode == 0) return;
+
+    if (targetDetected.data == -1) {
+        process_resources(message);
+    }
+    else if (current_state==DROPOFF_STATE && !is_home_seen)
+    {
+        process_home_tags(message);
+    }
+}
+
+void process_resources(const shared_messages::TagsImage::ConstPtr &message) {
+    for (int i = 0; i < message->tags.data.size(); i++) {
+        //check if target has not yet been collected
+        if (message->tags.data[i] != 256 && !targetsCollected[message->tags.data[i]]) {
+            is_resource_picked_up = true;
+            //copy target ID to class variable
+            targetDetected.data = message->tags.data[i];
+            //publish detected target
+            target_collected_publisher.publish(targetDetected);
+            //publish to scoring code
+            targetPickUpPublish.publish(message->image);
+            std_msgs::Int16 claimed_id;
+            claimed_id.data = message->tags.data[i];
+            pickup_publisher.publish(claimed_id);
+            return;
+        }
+    }
+}
+
+void process_home_tags(const shared_messages::TagsImage::ConstPtr &message) {
+    for (int i = 0; i < message->tags.data.size(); i++) {
+        int tag_id = message->tags.data[i];
+        if (tag_id == 256) {
+            is_home_seen = true;
+            if (targetDetected.data != -1) {
+                //publish to scoring code
+                targetDropOffPublish.publish(message->image);
+                targetDetected.data = -1;
+                return;
+            }
+        }
+    }
+    is_home_seen = false;
+}
+
+float distanceToHome() {
+    return hypotf(0-current_location.x, 0-current_location.y);
+}
+
+void projectArrivalHandler(const std_msgs::Float32::ConstPtr &message) {
+    deleteFromDistanceVector(message->data);
+}
+
+void projectPickupHandler(const std_msgs::Float32::ConstPtr &message) {
+     insertIntoDistanceVector(message->data);
+}
+
+void deleteFromDistanceVector(float distance) {
+    distances.erase(remove(distances.begin(), distances.end(), distance), distances.end());
+}
+
+void insertIntoDistanceVector(float distance) {
+    if (find(distances.begin(), distances.end(), distance) == distances.end()) {
+        distances.insert( upper_bound(distances.begin(),distances.end(),distance), distance);
+        std_msgs::String info_for_paper;
+        std::stringstream ss_converter;
+        ss_converter << "INSERTED: vector size = " << distances.size();
+        info_for_paper.data = ss_converter.str();
+        info_for_paper_publisher.publish(info_for_paper);
+    }
+}
+
+void pickupHandler(const std_msgs::Int16::ConstPtr &message) {
+    targetsCollected[message->data] = true;
 }
 
 void modeHandler(const std_msgs::UInt8::ConstPtr &message)
@@ -252,16 +448,30 @@ void modeHandler(const std_msgs::UInt8::ConstPtr &message)
 
 void obstacleHandler(const std_msgs::UInt8::ConstPtr &message)
 {
-    if ( message->data > 0 )
-    {
-        if (message->data == 1)
-        {
-            // obstacle on right side
+    const double PI_OVER_4 = 0.78539816339;
+
+    if ((message->data > 0)) { // before this had & !target_collected
+        double distance_to_move = 1;//rng->uniformReal(0, 1);
+        if (message->data == 1) {
+            // select new heading 0.2 radians to the left
+            //goalLocation.theta = current_location.theta + 0.6;
+            alternative_location.x = current_location.x + distance_to_move*cos(current_location.theta + PI_OVER_4);
+            alternative_location.y = current_location.y + distance_to_move*sin(current_location.theta + PI_OVER_4);
+            alternative_location.theta = current_location.theta + PI_OVER_4;
+                  setVelocity(-0, 0.3);
         }
-        else
-        {
-            //obstacle in front or on left side
+        // obstacle in front or on left side
+        else if (message->data == 2) {
+            // select new heading 0.2 radians to the right
+            //goalLocation.theta = current_location.theta + 0.6;
+            alternative_location.x = current_location.x + distance_to_move*cos(current_location.theta - PI_OVER_4);
+            alternative_location.y = current_location.y + distance_to_move*sin(current_location.theta - PI_OVER_4);
+            alternative_location.theta = current_location.theta - PI_OVER_4;
+                setVelocity(-0, -0.3);
         }
+        obstacle_encountered = true;
+         //double angular_velocity = rotational_translational_controller.calculateVelocity(current_location, goal);
+
     }
 }
 
@@ -321,117 +531,22 @@ void sigintEventHandler(int sig)
     ros::shutdown();
 }
 
-void messageHandler(const std_msgs::String::ConstPtr& message)
+double computeGoalTheta()
 {
+    return atan2(goal.y - current_location.y, goal.x - current_location.x);
 }
-
-double parseDouble(string double_string) {
-    stringstream stream;
-    stream << double_string;
-    double double_value;
-    stream >> double_value;
-    return double_value;
-}
-
-int parseInt(string int_string) {
-    stringstream stream;
-    stream << int_string;
-    int int_value;
-    stream >> int_value;
-    return int_value;
-}
-
-void parsePoseMessage(string msg_string){
-    int name_position = msg_string.find_first_of(" ");
-    string message_rover_name = msg_string.substr(0,name_position);
-    msg_string = msg_string.substr(name_position+1);
-    int x_position = msg_string.find_first_of(" ");
-    string x_message = msg_string.substr(0,x_position);
-    double x = parseDouble(x_message);
-    msg_string = msg_string.substr(x_position+1);
-    int y_position = msg_string.find_first_of(" ");
-    string y_message = msg_string.substr(0,y_position);
-    double y = parseDouble(y_message);
-    msg_string = msg_string.substr(y_position+1);
-    double theta = parseDouble(msg_string);
-    pose location;
-    location.x = x;
-    location.y = y;
-    location.theta = theta;
-    rover_locations[message_rover_name] = location;
-}
-
-double computeAndPublishGlobalAverageHeading() {
-
-    double global_average_heading;
-    if (rover_locations.empty()) {
-        global_average_heading = current_location.theta;
-    }
-    else {
-        double average_cosine = 0;
-        double average_sine = 0;
-        for (map<string, pose>::iterator rover_iterator = rover_locations.begin(); rover_iterator != rover_locations.end(); ++rover_iterator) {
-            average_cosine += cos(rover_iterator->second.theta);
-            average_sine += sin(rover_iterator->second.theta);
-        }
-        global_average_heading = atan2(average_sine,average_cosine);
-    }
-    return global_average_heading;
-}
-double computeAndPublishLocalAverageHeading() {
-    double average_cosine = 0;
-    double average_x = 0;
-    double average_y = 0;
-    double average_sine = 0;
-    int neighbor_count = 0;
-    for (map<string, pose>::iterator rover_iterator = rover_locations.begin(); rover_iterator != rover_locations.end(); ++rover_iterator) {
-        if (rover_iterator->first != rover_name) {
-            double delta_x = current_location.x - rover_iterator->second.x;
-            double delta_y = current_location.y - rover_iterator->second.y;
-            double distance = hypot(delta_x,delta_y);
-
-            if (distance <= 2.0) {
-                average_x += (rover_iterator->second.x - current_location.x);
-                average_y += (rover_iterator->second.y - current_location.y);
-                average_cosine += cos(rover_iterator->second.theta);
-                average_sine += sin(rover_iterator->second.theta);
-                neighbor_count += 1;
-            }
-        }
-    }
-    double local_average_heading;
-    if (neighbor_count > 0) {
-        average_x = current_location.x + (average_x/neighbor_count);
-        average_y = current_location.y + (average_y/neighbor_count);
-        local_average_heading = atan2(average_y,average_x);
-    }
-    else {
-        local_average_heading = current_location.theta;
-    }
-    return local_average_heading;
-}
-
-void poseHandler(const std_msgs::String::ConstPtr &message)
+/***********************
+ * CUSTOM MESSAGE HANDLERS
+ ************************/
+bool isGoalReachedR()
 {
-    parsePoseMessage(message->data);
-    computeAndPublishGlobalAverageHeading();
-    computeAndPublishLocalAverageHeading();
+    goal.theta = computeGoalTheta();
+    float distance_to_goal = fabs(angles::shortest_angular_distance(current_location.theta, goal.theta));
+    return distance_to_goal < 0.25; // 0.25 radians around goal heading
 }
 
-
-
-void nameHandler(const std_msgs::String::ConstPtr &message)
+bool isGoalReached()
 {
-    if (state_machine_state == COUNT_STATE) {
-    string msg_string = message->data;
-    int name_position = msg_string.find_first_of(" ");
-    string message_rover_name = msg_string.substr(0,name_position);
-    pair<set<string>::iterator,bool> ret = rover_names.insert(message_rover_name);
-    if (ret.second) {
-        count_same=0;
-    }
-    else {
-        count_same++;
-    }
-    }
+    float distance_to_goal = hypotf(goal.x-current_location.x, goal.y-current_location.y);
+    return distance_to_goal < 0.5; // 0.5 meter circle around target waypoint.
 }
